@@ -31,8 +31,6 @@ RUN cmake .. \
     -DUSE_OPENMP=ON \
     -DUSE_GPU=OFF \
     -DUSE_SWIG=OFF \
-    -DUSE_HDFS=OFF \
-    -DUSE_R35=OFF \
     -DUSE_TIMETAG=OFF \
     -DBUILD_STATIC_LIB=ON \
     -DBUILD_CLI=OFF \
