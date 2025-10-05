@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       lightgbm_version:
-        description: 'LightGBM version/tag to build (e.g., v4.1.0, stable)'
+        description: LightGBM version/tag to build (e.g., v4.6.0, stable)
         required: false
-        default: 'stable'
+        default: stable
 
 env:
   DOCKER_REGISTRY: docker.io
@@ -56,16 +56,21 @@ jobs:
         with:
           images: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}
           tags: |
+            # Branch builds
             type=ref,event=branch
+            # PR builds
             type=ref,event=pr
+            # Tag builds
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            # Latest tag for default branch
             type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix={{branch}}-,format=short
+            # Date-based tag for main branch
+            type=raw,value={{date 'YYYYMMDD'}},enable={{is_default_branch}}
+            # SHA-based tags
+            type=sha,format=short,prefix={{branch}}-
           flavor: |
-            latest=true
-            suffix=-{{date 'YYYYMMDD'}},enable={{is_default_branch}}
+            latest=auto
 
       - name: Determine LightGBM version
         id: lgbm_version
@@ -76,98 +81,11 @@ jobs:
             echo "version=stable" >> $GITHUB_OUTPUT
           fi
 
-      - name: Create optimized Dockerfile
-        run: |
-          cat > Dockerfile.minimal << 'EOF'
-          # Build stage: Create LightGBM static library
-          FROM alpine:3.22 AS builder
-
-          ARG LIGHTGBM_VERSION=stable
-
-          # Install build dependencies
-          RUN apk add --no-cache \
-              git \
-              cmake \
-              make \
-              g++ \
-              gcc \
-              libc-dev \
-              linux-headers \
-              libgomp \
-              eigen-dev \
-              openblas-dev \
-              zlib-dev \
-              zlib-static \
-              bash
-
-          # Clone and build LightGBM
-          WORKDIR /build
-          RUN git clone --recursive https://github.com/microsoft/LightGBM && \
-              cd LightGBM && \
-              git checkout ${LIGHTGBM_VERSION}
-
-          WORKDIR /build/LightGBM/build
-          RUN cmake .. \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DUSE_OPENMP=ON \
-              -DUSE_GPU=OFF \
-              -DUSE_SWIG=OFF \
-              -DUSE_HDFS=OFF \
-              -DUSE_R35=OFF \
-              -DUSE_TIMETAG=OFF \
-              -DBUILD_STATIC_LIB=ON \
-              -DBUILD_CLI=OFF \
-              -DCMAKE_CXX_FLAGS="-static-libgcc -static-libstdc++ -fopenmp -pthread" \
-              -DCMAKE_POSITION_INDEPENDENT_CODE=ON && \
-              make -j$(nproc) && \
-              make install
-
-          # Verify the build
-          RUN echo "=== Build Verification ===" && \
-              ls -lh /usr/local/lib/lib_lightgbm.a && \
-              nm /usr/local/lib/lib_lightgbm.a | grep -i "LGBM_" | head -5 && \
-              echo "OpenMP symbols:" && \
-              nm /usr/local/lib/lib_lightgbm.a | grep -i omp | head -3 || echo "No OpenMP symbols"
-
-          # Create metadata
-          RUN echo "LightGBM Static Library Build Info" > /build_info.txt && \
-              echo "====================================" >> /build_info.txt && \
-              echo "Build Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> /build_info.txt && \
-              echo "LightGBM Version: ${LIGHTGBM_VERSION}" >> /build_info.txt && \
-              echo "Git SHA: $(cd /build/LightGBM && git rev-parse HEAD)" >> /build_info.txt && \
-              echo "Architecture: $(uname -m)" >> /build_info.txt && \
-              echo "Alpine Version: 3.22" >> /build_info.txt && \
-              echo "GCC Version: $(gcc --version | head -1)" >> /build_info.txt && \
-              echo "CMake Version: $(cmake --version | head -1)" >> /build_info.txt && \
-              echo "Library Size: $(ls -lh /usr/local/lib/lib_lightgbm.a | awk '{print $5}')" >> /build_info.txt && \
-              echo "Features: OpenMP=ON, GPU=OFF, Static=YES" >> /build_info.txt
-
-          # Final minimal stage with just the library
-          FROM busybox:1.36 AS final
-
-          # Copy only the static library and headers
-          COPY --from=builder /usr/local/lib/lib_lightgbm.a /lib/
-          COPY --from=builder /usr/local/include/LightGBM /include/LightGBM/
-          COPY --from=builder /build_info.txt /
-
-          # Add labels
-          LABEL org.opencontainers.image.title="LightGBM Static Library for ARM64" \
-                org.opencontainers.image.description="Minimal image containing only LightGBM static library (lib_lightgbm.a) built for ARM64 with OpenMP support" \
-                org.opencontainers.image.vendor="Jacob Magnusson" \
-                org.opencontainers.image.authors="m@jacobian.se" \
-                org.opencontainers.image.source="https://github.com/jacobsvante/lightgbm-static-aarch64" \
-                org.opencontainers.image.documentation="https://github.com/jacobsvante/lightgbm-static-aarch64/blob/main/README.md" \
-                org.opencontainers.image.licenses="MIT"
-
-          # Default command to show contents
-          CMD ["sh", "-c", "echo '=== LightGBM Static Library ==='; cat /build_info.txt; echo; echo '=== Contents ==='; ls -la /lib/lib_lightgbm.a; echo; echo '=== Headers ==='; find /include -type f | head -20"]
-          EOF
-
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile.minimal
+          file: Dockerfile
           platforms: ${{ matrix.platform }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
