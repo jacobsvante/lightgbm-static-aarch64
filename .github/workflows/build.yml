@@ -1,0 +1,257 @@
+name: Build and Push LightGBM Static Library
+
+on:
+  push:
+    branches: [ main ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      lightgbm_version:
+        description: 'LightGBM version/tag to build (e.g., v4.1.0, stable)'
+        required: false
+        default: 'stable'
+
+env:
+  DOCKER_REGISTRY: docker.io
+  # Change this to your Docker Hub username
+  DOCKER_USERNAME: ${{ vars.DOCKER_USERNAME }}
+  IMAGE_NAME: lightgbm-static-aarch64
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform:
+          - linux/arm64
+          # Uncomment to also build for amd64
+          # - linux/amd64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix={{branch}}-,format=short
+          flavor: |
+            latest=true
+            suffix=-{{date 'YYYYMMDD'}},enable={{is_default_branch}}
+
+      - name: Determine LightGBM version
+        id: lgbm_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.lightgbm_version }}" ]; then
+            echo "version=${{ github.event.inputs.lightgbm_version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=stable" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create optimized Dockerfile
+        run: |
+          cat > Dockerfile.minimal << 'EOF'
+          # Build stage: Create LightGBM static library
+          FROM alpine:3.22 AS builder
+
+          ARG LIGHTGBM_VERSION=stable
+
+          # Install build dependencies
+          RUN apk add --no-cache \
+              git \
+              cmake \
+              make \
+              g++ \
+              gcc \
+              libc-dev \
+              linux-headers \
+              libgomp \
+              eigen-dev \
+              openblas-dev \
+              zlib-dev \
+              zlib-static \
+              bash
+
+          # Clone and build LightGBM
+          WORKDIR /build
+          RUN git clone --recursive https://github.com/microsoft/LightGBM && \
+              cd LightGBM && \
+              git checkout ${LIGHTGBM_VERSION}
+
+          WORKDIR /build/LightGBM/build
+          RUN cmake .. \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DUSE_OPENMP=ON \
+              -DUSE_GPU=OFF \
+              -DUSE_SWIG=OFF \
+              -DUSE_HDFS=OFF \
+              -DUSE_R35=OFF \
+              -DUSE_TIMETAG=OFF \
+              -DBUILD_STATIC_LIB=ON \
+              -DBUILD_CLI=OFF \
+              -DCMAKE_CXX_FLAGS="-static-libgcc -static-libstdc++ -fopenmp -pthread" \
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON && \
+              make -j$(nproc) && \
+              make install
+
+          # Verify the build
+          RUN echo "=== Build Verification ===" && \
+              ls -lh /usr/local/lib/lib_lightgbm.a && \
+              nm /usr/local/lib/lib_lightgbm.a | grep -i "LGBM_" | head -5 && \
+              echo "OpenMP symbols:" && \
+              nm /usr/local/lib/lib_lightgbm.a | grep -i omp | head -3 || echo "No OpenMP symbols"
+
+          # Create metadata
+          RUN echo "LightGBM Static Library Build Info" > /build_info.txt && \
+              echo "====================================" >> /build_info.txt && \
+              echo "Build Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> /build_info.txt && \
+              echo "LightGBM Version: ${LIGHTGBM_VERSION}" >> /build_info.txt && \
+              echo "Git SHA: $(cd /build/LightGBM && git rev-parse HEAD)" >> /build_info.txt && \
+              echo "Architecture: $(uname -m)" >> /build_info.txt && \
+              echo "Alpine Version: 3.22" >> /build_info.txt && \
+              echo "GCC Version: $(gcc --version | head -1)" >> /build_info.txt && \
+              echo "CMake Version: $(cmake --version | head -1)" >> /build_info.txt && \
+              echo "Library Size: $(ls -lh /usr/local/lib/lib_lightgbm.a | awk '{print $5}')" >> /build_info.txt && \
+              echo "Features: OpenMP=ON, GPU=OFF, Static=YES" >> /build_info.txt
+
+          # Final minimal stage with just the library
+          FROM busybox:1.36 AS final
+
+          # Copy only the static library and headers
+          COPY --from=builder /usr/local/lib/lib_lightgbm.a /lib/
+          COPY --from=builder /usr/local/include/LightGBM /include/LightGBM/
+          COPY --from=builder /build_info.txt /
+
+          # Add labels
+          LABEL org.opencontainers.image.title="LightGBM Static Library for ARM64" \
+                org.opencontainers.image.description="Minimal image containing only LightGBM static library (lib_lightgbm.a) built for ARM64 with OpenMP support" \
+                org.opencontainers.image.vendor="Jacob Magnusson" \
+                org.opencontainers.image.authors="m@jacobian.se" \
+                org.opencontainers.image.source="https://github.com/jacobsvante/lightgbm-static-aarch64" \
+                org.opencontainers.image.documentation="https://github.com/jacobsvante/lightgbm-static-aarch64/blob/main/README.md" \
+                org.opencontainers.image.licenses="MIT"
+
+          # Default command to show contents
+          CMD ["sh", "-c", "echo '=== LightGBM Static Library ==='; cat /build_info.txt; echo; echo '=== Contents ==='; ls -la /lib/lib_lightgbm.a; echo; echo '=== Headers ==='; find /include -type f | head -20"]
+          EOF
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.minimal
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            LIGHTGBM_VERSION=${{ steps.lgbm_version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create multi-platform manifest (if multiple platforms)
+        if: github.event_name != 'pull_request' && strategy.job-total > 1
+        run: |
+          docker buildx imagetools create \
+            --tag ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest \
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest-linux-arm64 \
+            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest-linux-amd64
+
+  # Optional: Create a release with the library file
+  extract-and-release:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract library from image
+        run: |
+          # Pull the image
+          docker pull ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+
+          # Extract the library
+          docker create --name temp ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+          docker cp temp:/lib/lib_lightgbm.a ./
+          docker cp temp:/include ./
+          docker cp temp:/build_info.txt ./
+          docker rm temp
+
+          # Create archives
+          tar -czf lightgbm-static-aarch64.tar.gz lib_lightgbm.a include/ build_info.txt
+          zip -r lightgbm-static-aarch64.zip lib_lightgbm.a include/ build_info.txt
+
+          # Generate checksums
+          sha256sum lib_lightgbm.a > SHA256SUMS
+          sha256sum lightgbm-static-aarch64.tar.gz >> SHA256SUMS
+          sha256sum lightgbm-static-aarch64.zip >> SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            lib_lightgbm.a
+            lightgbm-static-aarch64.tar.gz
+            lightgbm-static-aarch64.zip
+            build_info.txt
+            SHA256SUMS
+          body: |
+            # LightGBM Static Library for ARM64
+
+            This release contains the LightGBM static library built for ARM64 (aarch64) architecture.
+
+            ## Features
+            - Built with OpenMP support for multi-threading
+            - Fully static library (no runtime dependencies)
+            - Optimized for ARM64/aarch64 architecture
+            - Includes all C API headers
+
+            ## Files
+            - `lib_lightgbm.a` - The static library
+            - `lightgbm-static-aarch64.tar.gz` - Library + headers (tar.gz)
+            - `lightgbm-static-aarch64.zip` - Library + headers (zip)
+            - `build_info.txt` - Build configuration details
+            - `SHA256SUMS` - Checksums for verification
+
+            ## Docker Image
+            ```bash
+            docker pull ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ```
+
+            ## Extracting from Docker
+            ```bash
+            docker run --rm -v $(pwd):/output ${{ env.DOCKER_USERNAME }}/lightgbm-static-aarch64:latest \
+              sh -c "cp /lib/lib_lightgbm.a /output/ && cp -r /include /output/"
+            ```
+          draft: false
+          prerelease: false
