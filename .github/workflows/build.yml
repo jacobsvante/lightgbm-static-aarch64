@@ -27,7 +27,7 @@ jobs:
       matrix:
         platform:
           - linux/arm64
-          - linux/amd64
+          # - linux/amd64
 
     steps:
       - name: Checkout repository
@@ -92,11 +92,3 @@ jobs:
             LIGHTGBM_VERSION=${{ steps.lgbm_version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Create multi-platform manifest (if multiple platforms)
-        if: github.event_name != 'pull_request' && strategy.job-total > 1
-        run: |
-          docker buildx imagetools create \
-            --tag ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest \
-            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest-linux-arm64 \
-            ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest-linux-amd64
