@@ -27,8 +27,7 @@ jobs:
       matrix:
         platform:
           - linux/arm64
-          # Uncomment to also build for amd64
-          # - linux/amd64
+          - linux/amd64
 
     steps:
       - name: Checkout repository
@@ -41,6 +40,15 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Determine LightGBM version
+        id: lgbm_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.lightgbm_version }}" ]; then
+            echo "version=${{ github.event.inputs.lightgbm_version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=stable" >> $GITHUB_OUTPUT
+          fi
 
       - name: Log in to Docker Hub
         if: github.event_name != 'pull_request'
@@ -60,26 +68,16 @@ jobs:
             type=ref,event=branch
             # PR builds
             type=ref,event=pr
-            # Tag builds
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             # Latest tag for default branch
             type=raw,value=latest,enable={{is_default_branch}}
+            # LightGBM version tag
+            type=raw,value=${{ steps.lgbm_version.outputs.version }},enable={{is_default_branch}}
             # Date-based tag for main branch
-            type=raw,value={{date 'YYYYMMDD'}},enable={{is_default_branch}}
+            type=raw,value=${{ steps.lgbm_version.outputs.version }}-{{date 'YYYY-MM-DD'}},enable={{is_default_branch}}
             # SHA-based tags
             type=sha,format=short,prefix={{branch}}-
           flavor: |
             latest=auto
-
-      - name: Determine LightGBM version
-        id: lgbm_version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.lightgbm_version }}" ]; then
-            echo "version=${{ github.event.inputs.lightgbm_version }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=stable" >> $GITHUB_OUTPUT
-          fi
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -102,74 +100,3 @@ jobs:
             --tag ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest \
             ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest-linux-arm64 \
             ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest-linux-amd64
-
-  # Optional: Create a release with the library file
-  extract-and-release:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-
-    steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Extract library from image
-        run: |
-          # Pull the image
-          docker pull ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
-
-          # Extract the library
-          docker create --name temp ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:latest
-          docker cp temp:/lib/lib_lightgbm.a ./
-          docker cp temp:/include ./
-          docker cp temp:/build_info.txt ./
-          docker rm temp
-
-          # Create archives
-          tar -czf lightgbm-static-aarch64.tar.gz lib_lightgbm.a include/ build_info.txt
-          zip -r lightgbm-static-aarch64.zip lib_lightgbm.a include/ build_info.txt
-
-          # Generate checksums
-          sha256sum lib_lightgbm.a > SHA256SUMS
-          sha256sum lightgbm-static-aarch64.tar.gz >> SHA256SUMS
-          sha256sum lightgbm-static-aarch64.zip >> SHA256SUMS
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            lib_lightgbm.a
-            lightgbm-static-aarch64.tar.gz
-            lightgbm-static-aarch64.zip
-            build_info.txt
-            SHA256SUMS
-          body: |
-            # LightGBM Static Library for ARM64
-
-            This release contains the LightGBM static library built for ARM64 (aarch64) architecture.
-
-            ## Features
-            - Built with OpenMP support for multi-threading
-            - Fully static library (no runtime dependencies)
-            - Optimized for ARM64/aarch64 architecture
-            - Includes all C API headers
-
-            ## Files
-            - `lib_lightgbm.a` - The static library
-            - `lightgbm-static-aarch64.tar.gz` - Library + headers (tar.gz)
-            - `lightgbm-static-aarch64.zip` - Library + headers (zip)
-            - `build_info.txt` - Build configuration details
-            - `SHA256SUMS` - Checksums for verification
-
-            ## Docker Image
-            ```bash
-            docker pull ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-            ```
-
-            ## Extracting from Docker
-            ```bash
-            docker run --rm -v $(pwd):/output ${{ env.DOCKER_USERNAME }}/lightgbm-static-aarch64:latest \
-              sh -c "cp /lib/lib_lightgbm.a /output/ && cp -r /include /output/"
-            ```
-          draft: false
-          prerelease: false
