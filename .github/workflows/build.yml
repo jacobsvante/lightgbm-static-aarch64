@@ -102,6 +102,6 @@ jobs:
 
       - uses: actions/upload-artifact@v5
         with:
-          name: lightgbm-${{ steps.lgbm_version.outputs.version }}-${{ matrix.arch }}
+          name: lightgbm-${{ steps.lgbm_version.outputs.version }}-${{ matrix.platform.arch }}
           path: lib_lightgbm.a
           if-no-files-found: error
